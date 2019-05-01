@@ -5,7 +5,7 @@ from itertools import groupby, combinations
 from operator import *
 from collections import Counter
 import tempfile
-from subprocess import Popen, PIPE, STDOUT
+from subprocess import Popen, PIPE, STDOUT, call
 import inspect
 import shlex
 import shutil
@@ -3307,10 +3307,309 @@ class Ontology(object):
             ont.add_root('ROOT', inplace=True)
             return ont
         elif method == 'infomap':
-            raise Exception('Infomap integration is under development')
+            ont = cls.run_infomap(graph,**kwargs)
+            return ont
         else:
             raise Exception("Unsupported method of community detection")
         return
+
+    @classmethod
+    def run_infomap(cls,
+        input_graph,
+        square=False,
+        square_names=None,
+        output=None,
+        verbose=False,
+        debug=False,
+        infomap_executable = 'Infomap',
+        overlapping=True,
+        undirected=True,
+        *args, **kwargs):
+        """Parses InfoMap tree output to ddot compatible format
+
+        see help(run_im) for remaining parameters
+
+        Parameters
+        ----------
+
+        overlapping: boolean
+
+            If true, will merge identical terms in hierarchy 
+            (tree-like hierarchy-->DAG-like hierarchy). Use this option if InfoMap. 
+            Use this option when running InfoMap with --overlapping option and wanting DAG 
+            output.
+
+        mapping: boolean
+
+            If true, will map back node names to original ones according to 
+            mapper (see parse_adjList_infomap)
+
+        mapper: dictionary or None
+            A dictionary mapping original node names to their numeric representation 
+            for InfoMap input.
+            example:
+
+                { 1: 'geneA', 2: 'geneB'}
+
+        Returns
+        -------
+        : ddot.Ontology.Ontology
+
+        """
+
+        def merge_identical_terms(df,n_layers):
+            """ Hratch
+            """
+            for col in range(n_layers-2,-1,-1): # merge terms column by column
+                df.sort_values(by = [col], ascending = False, inplace = True)
+                counts_ = dict(df[col].value_counts())
+                counts_.pop(0.0,None)
+                children = {}
+                for key in counts_:  #lists all children that aren't 0
+                    child = df[(df[col]==key)].iloc[:,col+1:].values
+                    children[key] = child[child!=0].tolist()
+
+                counts = {} #invert counts_ dictionary
+                for k, v in counts_.items():
+                    keys = counts.setdefault(v, [])
+                    keys.append(k)
+
+                identicalTerms = {}
+                for key in counts: # only if same number of terms
+                    for term in itertools.combinations(counts[key],2): #pairwise combination 
+                        if children[term[0]] == children[term[1]]: #checks for same children
+                            if term[0] not in (itertools.chain(*list(identicalTerms.values()))):
+                                if term[0] not in identicalTerms.keys(): 
+                                    identicalTerms[term[0]] = [term[1]]
+                                else:
+                                    identicalTerms[term[0]] += [term[1]]
+                map_ = {}
+                for k,v in identicalTerms.items():
+                    for t in v :
+                        map_.update({t:k})
+                df[col].replace(map_,inplace=True)
+            return df
+
+
+        def flow_2_ont(df,n_layers):
+            """ Process infomap output into ontology object
+                
+                Hratch's parser
+            """
+            P = []
+            C = []
+            Edgetype = []
+            for col in range(0,n_layers-1):
+                parent = set(df[col][df[col]!=0])
+                for p in parent:
+                    if col == 0: # add root
+                        r = max(parent)+1
+                        C.append(p)
+                        P.append(r)
+                        Edgetype.append('Child-Parent')
+                    child = set(df[col+1][(df[col] == p) & (df[col+1] != 0)])
+                    for c in child:
+                        P.append(p)
+                        C.append(c)
+                        if col == n_layers-2:
+                            Edgetype.append('Gene-Term')
+                        else:
+                            Edgetype.append('Child-Parent')
+                    # accounts for 0s
+                    if col != n_layers-2:
+                        child = set(df[n_layers-1][(df[col] == p) & (df[col+1] == 0)])
+                        for c in child:
+                            P.append(p)
+                            C.append(c)
+                            Edgetype.append('Gene-Term')
+
+            ont_data = {'Parent':P,'Child':C,'EdgeType':Edgetype}
+            ontDF1 = pd.DataFrame(data = ont_data)
+            ontDF2 = ontDF1.drop_duplicates(subset=None, keep='first', inplace=False)
+            ontDF2.sort_values(by=['EdgeType','Parent','Child'],inplace=True) # this line throws a warning
+            ontDF2.reset_index(drop = True,inplace=True)
+            return ontDF2
+
+        # do we have infomap installed?
+        if shutil.which(infomap_executable) is None:
+            raise Exception("Could not find InfoMap executable at {}".format(infomap_executable))
+        mapper = None
+        graph = input_graph.copy()
+
+        if output is None:
+            output_file = tempfile.NamedTemporaryFile('w', delete=False)
+            output = output_file.name
+            if verbose:
+                print('temp output:', output)
+            delete_output = True
+        else:
+            delete_output = False
+
+
+        # make adjacency file
+        if not (isinstance(graph, str) and os.path.exists(graph)):
+
+            if square:
+                assert graph.shape[1] == graph.shape[0]
+                
+                # get integer names ... starting at 1 for infomap
+                if square_names is None:
+                    rev_mapper = {j: i+1 for i, j in enumerate(graph.index.tolist())}
+                    mapper = {i+1:j for i, j in enumerate(graph.index.tolist())}
+                    square_names = [rev_mapper[j] for j in graph.index.tolist()]
+                    graph.index = square_names
+                    graph.columns = square_names
+
+                graph_sq = pd.DataFrame(graph, index=square_names, columns=square_names)
+                graph = melt_square(graph_sq)
+
+            else:
+                # TODO: fix node names for non square 
+                raise Exception("Non square input graph are not supported at this time.")
+
+            # Write graph into a temporary file.
+            # Assumes that <graph> is a list of 3-tuples (parent, child, score)
+            with tempfile.NamedTemporaryFile('w', delete=False) as graph_file:
+                try:
+                    graph.to_csv(graph_file, sep=' ', header=False, index=False)
+                except:
+                    graph_file.write('\n'.join([' '.join([str(x[0]),str(x[1]),str(x[2])]) for x in graph]) + '\n')
+            graph = graph_file.name
+            if verbose:
+                print('temp graph:', graph)
+            rerun, delete_graph = True, True
+        else:
+            delete_graph = False
+
+        curr_dt = None
+        start = time.time()
+    
+        output_directory = os.path.dirname(graph)
+
+        args0 = [graph, output_directory]
+
+        if overlapping:
+            args0.append("--overlapping")
+
+        if undirected:
+            args0.append("--undirected")
+
+        # add infomap parameters
+        args0.append("--tree")
+        args0.append("--input-format link-list")
+
+        # append flagged arguments
+        for arg in args:
+            if not arg.startswith("--"):
+                arg = "--{}".format(arg)
+            args0.append(arg)    
+
+        # append kwargs arguments
+        for flag, arg in kwargs.items():
+            if not flag.startswith("--"):
+                flag = "--{}".format(flag)
+            args0.append("{} {}".format(flag, arg))
+
+        # build 
+        args_ = " ".join(args0)
+
+        command = "{} {}".format(infomap_executable, args_)
+
+        if verbose:
+            print('INFOMAP command:', command)
+
+        p = call(command, shell=True, stdout=PIPE, stderr=STDOUT, bufsize=1)
+
+
+
+
+        ### Parse infomap output
+        tree_file = "{}.tree".format(os.path.splitext(graph)[0])
+
+        DF = pd.read_csv(tree_file, comment="#", sep=" ", header=None)
+        DF3 = DF.iloc[:,[0,2]]
+        DF4 = DF3.iloc[:,0].str.split(':',expand=True)
+        DF4.reset_index(inplace=True,drop=True)
+        DF4.fillna('0', inplace=True)
+        DF5 = DF4.copy()  
+        DF6 = DF5.iloc[:,0:DF4.shape[1]-1]
+        DF7 = DF6.copy()
+
+        #unique term labels for each term 
+        for j in range(1,DF7.shape[1],1):
+            DF7.iloc[:,j] = DF6.iloc[:,0:j+1].apply(lambda x: ''.join(x), axis=1)
+
+        for j in range(1,DF4.shape[1]):
+            DF7.iloc[DF4[DF4[j]=='0'].index.tolist(),j-1] = '0'
+            if j < DF4.shape[1]-1:
+                DF7.iloc[DF4[DF4[j]=='0'].index.tolist(),j] = '0'
+
+        n_layers = DF4.shape[1]
+
+        # replace terminal leaf labels with those from mapper (original gene names)
+        if mapper is not None:
+            DF9 = pd.to_numeric(DF3.iloc[:,1])
+            DF9.replace(mapper,inplace = True) 
+        else:
+            DF9 = DF3.iloc[:,1]
+
+
+        DF7 = DF7.astype(float)
+
+
+        # CliXO-like naming of terms
+        #n_genes = len(list(set(mapper.keys())))
+        n_genes = len(set(DF9))
+
+        DF8 = DF7.copy()
+        bottom = DF7.shape[1]-1
+        values = list(set(DF7[bottom].tolist()))
+        newValues = list(range(len(values)))
+        for i in range(len(values)):
+            if values[i] != 0:
+                rows = DF7[DF7[bottom]==values[i]].index.tolist()
+                DF8.iloc[rows,bottom] = newValues[i]+n_genes-1
+        for j in range(DF8.shape[1]-2,-1,-1):
+            values = list(set(DF8[j].tolist()+[0]))
+            newValues = list(range(len(values)))
+            add = max(DF8[j+1].tolist())
+            for i in range(len(values)):
+                if values[i] != 0:
+                    rows = DF8[DF8[j]==values[i]].index.tolist()
+                    DF8.iloc[rows,j] = newValues[i]+add
+
+        DF9 = pd.DataFrame(DF9)
+        DF9.rename(columns={DF9.columns[0]: DF8.shape[1]}, inplace=True)
+        DF9.reset_index(inplace=True,drop=True)
+        DF10 = pd.concat([DF8.astype(float),DF9],axis=1)
+        DF10.reset_index(inplace=True,drop=True)
+
+        # merge identical terms
+        if overlapping == True:
+            DF11 = merge_identical_terms(DF10,n_layers)
+            DF11.reset_index(inplace=True,drop=True)
+        else:
+            DF11 = DF10.copy()
+
+        # InfoMap enumerated paths --> DDOT parent-child relationships
+        DF12 = flow_2_ont(DF11,n_layers)
+
+        ont = cls.from_table(DF12)
+
+
+        # cleanup
+        if delete_graph:
+            os.remove(graph)
+        if delete_output is True:
+            os.remove(tree_file)
+        else:
+            shutil.copyfile(tree_file, output)
+            os.remove(tree_file)
+
+        if verbose: print('Ontology:', ont)
+
+
+        return ont
 
     @classmethod
     def run_scipy_linkage(cls,
